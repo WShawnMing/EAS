@@ -3,6 +3,8 @@ import triton
 import triton.language as tl
 import math
 
+from eas.core.kernels.benchmark.bench import benchmark_all
+
 
 
 # Q, K, V, output are tensors on the GPU
@@ -15,10 +17,11 @@ def attention_torch(
 
 
 @triton.jit
-def Attention(Q,K,V,O, sm_scale : tl.constexpr ,M: tl.constexpr, N: tl.constexpr, D: tl.constexpr,BLOCK_D: tl.constexpr,BLOCK_M: tl.constexpr,
+def FlashAttentionV0(Q,K,V,O, sm_scale : tl.constexpr ,M: tl.constexpr, N: tl.constexpr, D: tl.constexpr,BLOCK_D: tl.constexpr,BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr):
 
-
+    LOG2E = 1.4426950408889634
+    qk_scale = sm_scale * LOG2E
     # 加载每个program的q矩阵
     pid = tl.program_id(0) # M 维度
     offset_M = tl.arange(0, BLOCK_M) + pid*BLOCK_M
@@ -56,7 +59,7 @@ def Attention(Q,K,V,O, sm_scale : tl.constexpr ,M: tl.constexpr, N: tl.constexpr
         v = tl.load(V_ptr,mask=MASK_V,other=0.0)
 
         # Q @ K_t [BM, BN] 过滤掉最后几个无用的N
-        score = tl.dot(q, tl.trans(k)) * sm_scale
+        score = tl.dot(q, tl.trans(k)) *  qk_scale
         score = tl.where(offset_N[None, :] < N,score,-float("inf"),)
 
         # 计算单步 m 和 l
@@ -64,9 +67,9 @@ def Attention(Q,K,V,O, sm_scale : tl.constexpr ,M: tl.constexpr, N: tl.constexpr
 
         m_new = tl.maximum(m_i, m_block)  # [BM]
 
-        alpha = tl.exp(m_i - m_new) 
+        alpha = tl.exp2(m_i - m_new) 
 
-        p = tl.exp(score - m_new[:, None]) #  [BM, BN]
+        p = tl.exp2(score - m_new[:, None]) #  [BM, BN]
 
         l_i = l_i*alpha + tl.sum(p, axis=1)
         m_i = m_new
@@ -80,7 +83,7 @@ def Attention(Q,K,V,O, sm_scale : tl.constexpr ,M: tl.constexpr, N: tl.constexpr
 
     acc = acc / l_i[:,None]
     
-    tl.store(O_ptr,acc,mask=MASK_Q)
+    tl.store(O_ptr,acc,mask=MASK_O)
 
         
 
@@ -101,7 +104,7 @@ def solve(
         triton.cdiv(M, BLOCK_M),
     )
 
-    Attention[grid](
+    FlashAttentionV0[grid](
         Q,
         K,
         V,
@@ -114,3 +117,34 @@ def solve(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
     )
+
+
+def benchmark_attention(
+    M: int = 1024,
+    N: int = 1024,
+    d: int = 64,
+    warmup: int = 50,
+    repeat: int = 200,
+):
+    if not torch.cuda.is_available():
+        raise RuntimeError("attention benchmark requires a CUDA device")
+
+    Q = torch.randn((M, d), device="cuda", dtype=torch.float16)
+    K = torch.randn((N, d), device="cuda", dtype=torch.float16)
+    V = torch.randn((N, d), device="cuda", dtype=torch.float16)
+
+    torch_output = torch.empty((M, d), device="cuda", dtype=torch.float16)
+    triton_output = torch.empty((M, d), device="cuda", dtype=torch.float16)
+
+    return benchmark_all(
+        {
+            "torch": lambda: attention_torch(Q, K, V, torch_output, M, N, d),
+            "triton": lambda: solve(Q, K, V, triton_output, M, N, d),
+        },
+        warmup=warmup,
+        repeat=repeat,
+    )
+
+
+if __name__ == "__main__":
+    benchmark_attention()

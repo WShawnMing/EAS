@@ -3,22 +3,34 @@ import triton
 import triton.language as tl
 import math
 
-from eas.core.kernels.benchmark.bench import benchmark, benchmark_all
+from eas.core.kernels.benchmark.bench import benchmark_all
 
+
+V1_AUTOTUNE_BASE_CONFIGS = [
+    (16, 32, 4),
+    (16, 64, 4),
+    (32, 32, 4),
+    (32, 64, 4),
+    (32, 128, 4),
+    (64, 32, 4),
+    (64, 64, 4),
+    (64, 128, 4),
+    (128, 32, 4),
+    (128, 64, 4),
+    (32, 64, 8),
+    (64, 64, 8),
+]
+
+V1_AUTOTUNE_NUM_STAGES = [2, 3, 4]
 
 V1_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=4),
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=4),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_warps=4),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=8),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8),
+    triton.Config(
+        {"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N},
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    for BLOCK_M, BLOCK_N, num_warps in V1_AUTOTUNE_BASE_CONFIGS
+    for num_stages in V1_AUTOTUNE_NUM_STAGES
 ]
 
 
@@ -293,6 +305,7 @@ def solve_v1(
     BLOCK_M: int = 32,
     BLOCK_N: int = 32,
     num_warps: int = 4,
+    num_stages: int = 2,
 ):
     BLOCK_D = max(16, triton.next_power_of_2(d))
 
@@ -315,6 +328,7 @@ def solve_v1(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         num_warps=num_warps,
+        num_stages=num_stages,
     )
 
 
@@ -347,6 +361,35 @@ def solve_v1_autotuned(
     )
 
 
+def get_v1_autotune_config():
+    best_config = getattr(FlashAttention1V1Autotuned, "best_config", None)
+    if best_config is None:
+        return None
+
+    return {
+        "BLOCK_M": best_config.kwargs["BLOCK_M"],
+        "BLOCK_N": best_config.kwargs["BLOCK_N"],
+        "num_warps": best_config.num_warps,
+        "num_stages": best_config.num_stages,
+    }
+
+
+def print_v1_autotune_config():
+    config = get_v1_autotune_config()
+    if config is None:
+        print("Triton AutoTune Best Config: not selected yet")
+        return
+
+    print()
+    print("Triton AutoTune Best Config")
+    print(
+        f"BLOCK_M={config['BLOCK_M']}  "
+        f"BLOCK_N={config['BLOCK_N']}  "
+        f"num_warps={config['num_warps']}  "
+        f"num_stages={config['num_stages']}"
+    )
+
+
 def benchmark_attention(
     M: int = 1024,
     N: int = 1024,
@@ -366,7 +409,7 @@ def benchmark_attention(
     v1_output = torch.empty((M, d), device="cuda", dtype=torch.float16)
     v1_autotuned_output = torch.empty((M, d), device="cuda", dtype=torch.float16)
 
-    return benchmark_all(
+    results = benchmark_all(
         {
             "torch": lambda: attention_torch(Q, K, V, torch_output, M, N, d),
             "triton_exp": lambda: solve_v0(Q, K, V, v0_output, M, N, d),
@@ -376,71 +419,7 @@ def benchmark_attention(
         warmup=warmup,
         repeat=repeat,
     )
-
-
-def autotune_attention_v1(
-    M: int = 1024,
-    N: int = 1024,
-    d: int = 64,
-    warmup: int = 50,
-    repeat: int = 200,
-    configs=None,
-):
-    if not torch.cuda.is_available():
-        raise RuntimeError("attention autotune requires a CUDA device")
-
-    if configs is None:
-        configs = [
-            (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps)
-            for config in V1_AUTOTUNE_CONFIGS
-        ]
-
-    Q = torch.randn((M, d), device="cuda", dtype=torch.float16)
-    K = torch.randn((N, d), device="cuda", dtype=torch.float16)
-    V = torch.randn((N, d), device="cuda", dtype=torch.float16)
-    torch_output = torch.empty((M, d), device="cuda", dtype=torch.float16)
-
-    attention_torch(Q, K, V, torch_output, M, N, d)
-    torch.cuda.synchronize()
-
-    results = []
-    for BLOCK_M, BLOCK_N, num_warps in configs:
-        output = torch.empty((M, d), device="cuda", dtype=torch.float16)
-
-        def fn(BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, num_warps=num_warps):
-            solve_v1(Q, K, V, output, M, N, d, BLOCK_M, BLOCK_N, num_warps)
-
-        fn()
-        torch.cuda.synchronize()
-        if not torch.allclose(torch_output, output, atol=1e-2, rtol=1e-2):
-            diff = (torch_output - output).abs()
-            raise AssertionError(
-                f"config BM={BLOCK_M} BN={BLOCK_N} warps={num_warps} failed correctness: "
-                f"max_diff={diff.max().item():.6f}, mean_diff={diff.mean().item():.6f}"
-            )
-
-        result = benchmark(
-            name=f"BM{BLOCK_M}_BN{BLOCK_N}_W{num_warps}",
-            fn=fn,
-            warmup=warmup,
-            repeat=repeat,
-        )
-        results.append((BLOCK_M, BLOCK_N, num_warps, result))
-
-    results.sort(key=lambda x: x[3].median_ms)
-
-    print()
-    print("=" * 100)
-    print("FlashAttention1V1 Autotune")
-    print("=" * 100)
-    for BLOCK_M, BLOCK_N, num_warps, result in results:
-        print(
-            f"BM={BLOCK_M:<3} BN={BLOCK_N:<3} warps={num_warps:<2} "
-            f"median={result.median_ms:.4f} ms  "
-            f"mean={result.mean_ms:.4f} ms  "
-            f"p20={result.p20_ms:.4f} ms  "
-            f"p80={result.p80_ms:.4f} ms"
-        )
+    print_v1_autotune_config()
 
     return results
 

@@ -33,6 +33,13 @@ V1_AUTOTUNE_CONFIGS = [
     for num_stages in V1_AUTOTUNE_NUM_STAGES
 ]
 
+V1_PROFILE_CONFIG = {
+    "BLOCK_M": 16,
+    "BLOCK_N": 64,
+    "num_warps": 4,
+    "num_stages": 3,
+}
+
 
 # Q, K, V, output are tensors on the GPU
 def attention_torch(
@@ -338,6 +345,24 @@ def solve(
     solve_v1_autotuned(Q, K, V, output, M, N, d)
 
 
+def solve_v1_profile(
+    Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, output: torch.Tensor, M: int, N: int, d: int
+):
+    solve_v1(
+        Q,
+        K,
+        V,
+        output,
+        M,
+        N,
+        d,
+        V1_PROFILE_CONFIG["BLOCK_M"],
+        V1_PROFILE_CONFIG["BLOCK_N"],
+        V1_PROFILE_CONFIG["num_warps"],
+        V1_PROFILE_CONFIG["num_stages"],
+    )
+
+
 def solve_v1_autotuned(
     Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, output: torch.Tensor, M: int, N: int, d: int
 ):
@@ -359,6 +384,10 @@ def solve_v1_autotuned(
         d,
         BLOCK_D=BLOCK_D,
     )
+
+
+def get_v1_profile_config():
+    return dict(V1_PROFILE_CONFIG)
 
 
 def get_v1_autotune_config():
@@ -390,6 +419,62 @@ def print_v1_autotune_config():
     )
 
 
+def print_v1_profile_config():
+    config = get_v1_profile_config()
+    print()
+    print("FlashAttention1V1 Profile Config")
+    print(
+        f"BLOCK_M={config['BLOCK_M']}  "
+        f"BLOCK_N={config['BLOCK_N']}  "
+        f"num_warps={config['num_warps']}  "
+        f"num_stages={config['num_stages']}"
+    )
+
+
+def prepare_attention_profile_target(
+    M: int = 1024,
+    N: int = 1024,
+    d: int = 64,
+    warmup: int = 20,
+    repeat: int = 100,
+):
+    if not torch.cuda.is_available():
+        raise RuntimeError("attention profile target requires a CUDA device")
+
+    Q = torch.randn((M, d), device="cuda", dtype=torch.float16)
+    K = torch.randn((N, d), device="cuda", dtype=torch.float16)
+    V = torch.randn((N, d), device="cuda", dtype=torch.float16)
+
+    torch_output = torch.empty((M, d), device="cuda", dtype=torch.float16)
+    profile_output = torch.empty((M, d), device="cuda", dtype=torch.float16)
+
+    attention_torch(Q, K, V, torch_output, M, N, d)
+    solve_v1_profile(Q, K, V, profile_output, M, N, d)
+    torch.cuda.synchronize()
+
+    diff = (torch_output - profile_output).abs()
+    if not torch.allclose(torch_output, profile_output, atol=1e-2, rtol=1e-2):
+        raise AssertionError(
+            f"profile target failed correctness: "
+            f"max_diff={diff.max().item():.6f}, mean_diff={diff.mean().item():.6f}"
+        )
+
+    for _ in range(warmup):
+        solve_v1_profile(Q, K, V, profile_output, M, N, d)
+    torch.cuda.synchronize()
+
+    for _ in range(repeat):
+        solve_v1_profile(Q, K, V, profile_output, M, N, d)
+    torch.cuda.synchronize()
+
+    print_v1_profile_config()
+    print(
+        f"profile target ready: M={M} N={N} d={d} "
+        f"max_diff={diff.max().item():.6f} mean_diff={diff.mean().item():.6f} "
+        f"launches={repeat}"
+    )
+
+
 def benchmark_attention(
     M: int = 1024,
     N: int = 1024,
@@ -407,6 +492,7 @@ def benchmark_attention(
     torch_output = torch.empty((M, d), device="cuda", dtype=torch.float16)
     v0_output = torch.empty((M, d), device="cuda", dtype=torch.float16)
     v1_output = torch.empty((M, d), device="cuda", dtype=torch.float16)
+    v1_profile_output = torch.empty((M, d), device="cuda", dtype=torch.float16)
     v1_autotuned_output = torch.empty((M, d), device="cuda", dtype=torch.float16)
 
     results = benchmark_all(
@@ -414,11 +500,13 @@ def benchmark_attention(
             "torch": lambda: attention_torch(Q, K, V, torch_output, M, N, d),
             "triton_exp": lambda: solve_v0(Q, K, V, v0_output, M, N, d),
             "triton_exp2": lambda: solve_v1(Q, K, V, v1_output, M, N, d),
+            "triton_profile": lambda: solve_v1_profile(Q, K, V, v1_profile_output, M, N, d),
             "triton_auto": lambda: solve_v1_autotuned(Q, K, V, v1_autotuned_output, M, N, d),
         },
         warmup=warmup,
         repeat=repeat,
     )
+    print_v1_profile_config()
     print_v1_autotune_config()
 
     return results
